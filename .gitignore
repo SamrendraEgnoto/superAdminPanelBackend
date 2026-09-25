@@ -1,0 +1,12 @@
+/node_modules
+/.env
+/postman_collection.json
+/app.litcoffee
+
+/frontend_next
+/frontend
+/backups
+/Frontend
+
+/src/docs/apiRoutes.js
+/PROJECT_SUMMARY.md
