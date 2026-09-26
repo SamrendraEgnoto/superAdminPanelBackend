@@ -1,6 +1,7 @@
 import { sendMail, createTransporter } from './mailer.js';
 import Settings from '../models/Settings.js';
 import Admin from '../models/Admin.js';
+import SuperAdmin from '../models/SuperAdmin.js';
 import Notification from '../models/Notification.js';
 
 /**
@@ -79,19 +80,38 @@ class NotificationService {
       const adminId = admin?._id || admin || lead.managedByAdmin;
       let superAdminId = superAdmin?._id || superAdmin || lead.managedBySuperAdmin;
 
-      if (adminId && !superAdminId) {
+      // 1. Resolve Target Admin (RCA or DSA-created admin)
+      let targetAdmin = null;
+      if (adminId) {
         try {
-          const adm = await Admin.findById(adminId).select('createdById createdBy');
-          if (adm) {
-            superAdminId = adm.createdById || adm.createdBy;
+          if (admin && admin.email) {
+            targetAdmin = admin;
+          } else {
+            targetAdmin = await Admin.findById(adminId).select('_id email firstName companyName createdById createdBy');
           }
         } catch (e) {}
       }
 
-      // 1. In-App notification for Managing Admin
-      if (adminId) {
+      // 2. Resolve Target SuperAdmin ONLY if they are a Delegated Super Admin (DSA)
+      // Root Super Admin does NOT manage individual leads and must NEVER receive tenant lead notifications!
+      let targetDSA = null;
+      if (!superAdminId && targetAdmin) {
+        superAdminId = targetAdmin.createdById || targetAdmin.createdBy;
+      }
+      if (superAdminId) {
+        try {
+          const saId = superAdmin?._id || superAdminId;
+          const sa = (superAdmin && superAdmin.role) ? superAdmin : await SuperAdmin.findById(saId).select('_id role email');
+          if (sa && sa.role === 'delegated') {
+            targetDSA = sa;
+          }
+        } catch (e) {}
+      }
+
+      // 3. In-App notification for Managing Admin (Tenant / RCA)
+      if (targetAdmin) {
         await this.createInAppNotification({
-          recipient: adminId,
+          recipient: targetAdmin._id,
           recipientModel: 'Admin',
           title,
           message,
@@ -102,10 +122,11 @@ class NotificationService {
         });
       }
 
-      // 2. In-App notification for Managing SuperAdmin / DSA
-      if (superAdminId && String(superAdminId) !== String(adminId)) {
+      // 4. In-App notification for Delegated Super Admin (DSA)
+      // Only notify DSA if this lead belongs to DSA's branch
+      if (targetDSA && (!targetAdmin || String(targetDSA._id) !== String(targetAdmin._id))) {
         await this.createInAppNotification({
-          recipient: superAdminId,
+          recipient: targetDSA._id,
           recipientModel: 'SuperAdmin',
           title,
           message,
@@ -116,23 +137,11 @@ class NotificationService {
         });
       }
 
-      // 3. In-App notification for Root Super Admin (platform-level awareness)
-      await this.createInAppNotification({
-        recipient: null,
-        recipientRole: 'root',
-        title,
-        message,
-        type: 'info',
-        entityType: 'lead',
-        entityId: leadIdStr,
-        link
-      });
-
-      // 4. Also send email if configured for admin or SA
-      if (admin && admin.email) {
-        this.notifyNewLead(admin, lead).catch(err => console.error('Email error:', err));
-      } else if (superAdmin && superAdmin.email) {
-        this.notifyNewLead(superAdmin, lead).catch(err => console.error('Email error:', err));
+      // 5. Send email notification to Admin or DSA (NEVER to Root)
+      if (targetAdmin && targetAdmin.email) {
+        this.notifyNewLead(targetAdmin, lead).catch(err => console.error('Admin lead email error:', err));
+      } else if (targetDSA && targetDSA.email) {
+        this.notifyNewLead(targetDSA, lead).catch(err => console.error('DSA lead email error:', err));
       }
     } catch (err) {
       console.error('notifyLeadArrival error:', err);

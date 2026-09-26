@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import { encryptField, decryptField, hashEmail } from '../utils/encryption.js';
-import { getTenantDEK, ensureTenantDEK } from '../services/tenantCrypto.js';
+import { getTenantDEK, ensureTenantDEK, getAllCachedDEKs } from '../services/tenantCrypto.js';
 
 const UserSchema = new mongoose.Schema({
   firstName: { type: String, required: true },
@@ -123,6 +123,13 @@ const resolveFieldDecrypted = (val, adminId) => {
   const dek = adminId ? getTenantDEK(adminId) : null;
   if (dek) {
     const decrypted = decryptField(val, dek);
+    if (decrypted) return decrypted;
+  }
+
+  // Try all cached DEKs if specific tenant key didn't match (for cross-tenant/DSA branches)
+  const cachedDeks = getAllCachedDEKs();
+  for (const cDek of cachedDeks) {
+    const decrypted = decryptField(val, cDek);
     if (decrypted) return decrypted;
   }
 

@@ -43,6 +43,21 @@ const wrappedCache = new Map();
 const WRAPPED_REGISTRY_TTL_MS = 8 * 60 * 60 * 1000;
 const wrappedRegistry = new Map();
 
+/**
+ * Return all currently valid in-memory DEKs so decryptors can attempt
+ * resolution even when tenant scoping is multi-tenant or delegated.
+ */
+export const getAllCachedDEKs = () => {
+  const now = Date.now();
+  const deks = [];
+  for (const entry of dekCache.values()) {
+    if (entry && entry.expiresAt > now && entry.dek) {
+      deks.push(entry.dek);
+    }
+  }
+  return deks;
+};
+
 // ================= DEK generation =================
 
 export const generateDEK = () => crypto.randomBytes(32);

@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { encryptField, decryptField } from '../utils/encryption.js';
 
 const NotificationSchema = new mongoose.Schema({
   recipient: {
@@ -59,6 +60,37 @@ const NotificationSchema = new mongoose.Schema({
     default: Date.now
   }
 });
+
+// Automatically encrypt notification details (title & message) at rest in the database
+NotificationSchema.pre('save', function (next) {
+  if (this.title && !this.title.startsWith('gcm:')) {
+    const enc = encryptField(this.title);
+    if (enc) this.title = enc;
+  }
+  if (this.message && !this.message.startsWith('gcm:')) {
+    const enc = encryptField(this.message);
+    if (enc) this.message = enc;
+  }
+  next();
+});
+
+// Decrypt fields after retrieval when loaded as a Mongoose document
+NotificationSchema.post('init', function (doc) {
+  if (doc.title && doc.title.startsWith('gcm:')) {
+    doc.title = decryptField(doc.title) || doc.title;
+  }
+  if (doc.message && doc.message.startsWith('gcm:')) {
+    doc.message = decryptField(doc.message) || doc.message;
+  }
+});
+
+NotificationSchema.methods.getDecryptedTitle = function () {
+  return decryptField(this.title) || this.title;
+};
+
+NotificationSchema.methods.getDecryptedMessage = function () {
+  return decryptField(this.message) || this.message;
+};
 
 NotificationSchema.index({ recipient: 1, read: 1, createdAt: -1 });
 NotificationSchema.index({ recipientRole: 1, read: 1, createdAt: -1 });

@@ -35,7 +35,18 @@ export const getReports = async (req, res, next) => {
           ]
         }).select('_id isActive').lean();
         const adminIds = dsaAdminList.map(a => a._id);
+        const totalAdmins = dsaAdminList.length;
         const activeAdmins = dsaAdminList.filter(a => a.isActive).length;
+
+        // Users in the DSA subtree (under DSA admins or created directly by DSA)
+        const userFilter = {
+          $or: [
+            ...(adminIds.length > 0 ? [{ adminId: { $in: adminIds } }, { createdBy: { $in: adminIds } }] : []),
+            { adminId: id },
+            { createdBy: id },
+            ...(dsaObjId ? [{ adminId: dsaObjId }, { createdBy: dsaObjId }] : [])
+          ]
+        };
 
         const leadFilter = {
           $or: [
@@ -45,7 +56,9 @@ export const getReports = async (req, res, next) => {
           ]
         };
 
-        const [totalLeads, convertedLeads] = await Promise.all([
+        const [totalUsers, activeUsers, totalLeads, convertedLeads] = await Promise.all([
+          User.countDocuments(userFilter),
+          User.countDocuments({ ...userFilter, isActive: true }),
           BuildingInfo.countDocuments(leadFilter),
           BuildingInfo.countDocuments({
             ...leadFilter,
@@ -53,15 +66,26 @@ export const getReports = async (req, res, next) => {
           })
         ]);
 
-        stats.activeUsers = activeAdmins;
+        stats.totalAdmins = totalAdmins;
+        stats.activeAdmins = activeAdmins;
+        stats.inactiveAdmins = totalAdmins - activeAdmins;
+        stats.totalUsers = totalUsers;
+        stats.activeUsers = activeUsers;
         stats.totalLeads = totalLeads;
         stats.convertedLeads = convertedLeads;
       } else {
-        const [activeUsers, totalLeads, convertedLeads] = await Promise.all([
+        const [totalAdmins, activeAdmins, totalUsers, activeUsers, totalLeads, convertedLeads] = await Promise.all([
+          Admin.countDocuments(),
           Admin.countDocuments({ isActive: true }),
+          User.countDocuments(),
+          User.countDocuments({ isActive: true }),
           BuildingInfo.countDocuments(),
           BuildingInfo.countDocuments({ status: { $in: ['closed-won', 'won', 'closed', 'converted'] } })
         ]);
+        stats.totalAdmins = totalAdmins;
+        stats.activeAdmins = activeAdmins;
+        stats.inactiveAdmins = totalAdmins - activeAdmins;
+        stats.totalUsers = totalUsers;
         stats.activeUsers = activeUsers;
         stats.totalLeads = totalLeads;
         stats.convertedLeads = convertedLeads;

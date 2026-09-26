@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { encryptField, decryptField, hashEmail } from '../utils/encryption.js';
-import { getTenantDEK, ensureTenantDEK } from '../services/tenantCrypto.js';
+import { getTenantDEK, ensureTenantDEK, getAllCachedDEKs } from '../services/tenantCrypto.js';
 
 // Helper: get admin or super admin ID string for encryption key derivation
 const getAdminIdString = (doc) => {
@@ -83,6 +83,13 @@ const resolveFieldDecrypted = (val, adminId) => {
     if (decrypted) return decrypted;
   }
 
+  // Try all cached DEKs if specific tenant key didn't match (for cross-tenant/DSA leads)
+  const cachedDeks = getAllCachedDEKs();
+  for (const cDek of cachedDeks) {
+    const decrypted = decryptField(val, cDek);
+    if (decrypted) return decrypted;
+  }
+
   const legacy = decryptField(val);
   if (legacy) return legacy;
 
@@ -90,6 +97,36 @@ const resolveFieldDecrypted = (val, adminId) => {
     return val;
   }
   return '';
+};
+
+const decryptAssignedUsersList = (assignedUsers, fallbackAdminId) => {
+  if (!Array.isArray(assignedUsers)) return assignedUsers;
+  return assignedUsers.map((item) => {
+    if (!item) return item;
+    const rawUser = item.user;
+    if (rawUser && typeof rawUser === 'object') {
+      const u = typeof rawUser.toObject === 'function' ? rawUser.toObject() : { ...rawUser };
+      const uAdminId = (u.adminId || u.createdBy || fallbackAdminId || '').toString();
+
+      const fName = resolveFieldDecrypted(u.firstName, uAdminId) || u.firstName || '';
+      const lName = resolveFieldDecrypted(u.lastName, uAdminId) || u.lastName || '';
+      const email = resolveFieldDecrypted(u.email, uAdminId) || u.email || '';
+      const phone = resolveFieldDecrypted(u.phone || u.phoneNumber, uAdminId) || u.phone || u.phoneNumber || '';
+
+      return {
+        ...item,
+        user: {
+          ...u,
+          firstName: fName,
+          lastName: lName,
+          email,
+          phone,
+          phoneNumber: phone
+        }
+      };
+    }
+    return item;
+  });
 };
 
 // Helper instance method to get decrypted firstName
@@ -151,6 +188,9 @@ BuildingInfoSchema.methods.toJSON = function () {
     obj.userInfo.lastName = lastName;
     delete obj.userInfo.emailHash;
   }
+
+  obj.assignedUsers = decryptAssignedUsersList(obj.assignedUsers, getAdminIdString(this));
+
   return obj;
 };
 
@@ -175,6 +215,9 @@ BuildingInfoSchema.set('toObject', {
       ret.userInfo.lastName = lastName;
       delete ret.userInfo.emailHash;
     }
+
+    ret.assignedUsers = decryptAssignedUsersList(ret.assignedUsers, getAdminIdString(doc));
+
     return ret;
   }
 });

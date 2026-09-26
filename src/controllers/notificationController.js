@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import Notification from '../models/Notification.js';
+import { decryptField } from '../utils/encryption.js';
 
 /**
  * Get all notifications for the current authenticated user
@@ -16,22 +17,35 @@ export async function getNotifications(req, res, next) {
       userObjId = new mongoose.Types.ObjectId(userId);
     } catch (e) {}
 
-    const conditions = [
-      { recipient: userId },
-      ...(userObjId ? [{ recipient: userObjId }] : []),
-      { recipientRole: role },
-      { recipientRole: 'all' }
-    ];
-
+    let query;
     if (isRoot) {
-      conditions.push({ recipientRole: 'root' }, { recipientRole: 'superadmin' });
+      // Root Super Admin manages the SaaS platform, NEVER individual tenant leads.
+      // Strictly exclude any notifications where entityType === 'lead' or title has 'lead'
+      query = {
+        $and: [
+          {
+            $or: [
+              { recipient: userId },
+              ...(userObjId ? [{ recipient: userObjId }] : []),
+              { recipientRole: 'root' },
+              { recipientRole: 'superadmin' },
+              { recipientRole: 'all' }
+            ]
+          },
+          { entityType: { $ne: 'lead' } },
+          { title: { $not: /lead/i } }
+        ]
+      };
+    } else {
+      const conditions = [
+        { recipient: userId },
+        ...(userObjId ? [{ recipient: userObjId }] : [])
+      ];
+      if (role) conditions.push({ recipientRole: role });
+      if (dbRole && dbRole !== role) conditions.push({ recipientRole: dbRole });
+      conditions.push({ recipientRole: 'all' });
+      query = { $or: conditions };
     }
-
-    if (role === 'superadmin' || dbRole === 'delegated') {
-      conditions.push({ recipientRole: 'superadmin' });
-    }
-
-    const query = { $or: conditions };
 
     console.log(`[Notification Poll] User: ${req.user.email} (id: ${userId}, role: ${role}, dbRole: ${dbRole}, isRoot: ${isRoot})`);
 
@@ -43,18 +57,25 @@ export async function getNotifications(req, res, next) {
       Notification.countDocuments({ ...query, read: false })
     ]);
 
-    // Format for client
-    const formatted = notifications.map(n => ({
-      id: n._id.toString(),
-      title: n.title,
-      message: n.message,
-      type: n.type || 'info',
-      entityType: n.entityType || 'lead',
-      entityId: n.entityId || null,
-      link: n.link || (n.entityType === 'lead' && n.entityId ? `/leads/${n.entityId}` : null),
-      read: !!n.read,
-      createdAt: n.createdAt
-    }));
+    // Format for client with decrypted fields (plain text for UI)
+    const formatted = notifications
+      .map(n => ({
+        id: n._id.toString(),
+        title: decryptField(n.title) || n.title,
+        message: decryptField(n.message) || n.message,
+        type: n.type || 'info',
+        entityType: n.entityType || 'lead',
+        entityId: n.entityId || null,
+        link: n.link || (n.entityType === 'lead' && n.entityId ? `/leads/${n.entityId}` : null),
+        read: !!n.read,
+        createdAt: n.createdAt
+      }))
+      .filter(n => {
+        if (isRoot && (n.entityType === 'lead' || /lead/i.test(n.title) || /lead/i.test(n.message))) {
+          return false;
+        }
+        return true;
+      });
 
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.set('Pragma', 'no-cache');
@@ -85,7 +106,10 @@ export async function markAsRead(req, res, next) {
     if (!notif) {
       return res.status(404).json({ success: false, message: 'Notification not found' });
     }
-    return res.json({ success: true, data: notif });
+    const safeData = notif.toObject();
+    safeData.title = decryptField(safeData.title) || safeData.title;
+    safeData.message = decryptField(safeData.message) || safeData.message;
+    return res.json({ success: true, data: safeData });
   } catch (err) {
     console.error('markAsRead error:', err);
     next(err);
@@ -101,17 +125,39 @@ export async function markAllAsRead(req, res, next) {
     const role = req.user.role;
     const isRoot = role === 'root' || req.user.dbRole === 'root';
 
-    const conditions = [
-      { recipient: userId },
-      { recipientRole: role },
-      { recipientRole: 'all' }
-    ];
+    let query;
     if (isRoot) {
-      conditions.push({ recipientRole: 'root' }, { recipientRole: 'superadmin' });
+      query = {
+        $and: [
+          {
+            $or: [
+              { recipient: userId },
+              { recipientRole: 'root' },
+              { recipientRole: 'superadmin' },
+              { recipientRole: 'all' }
+            ]
+          },
+          { entityType: { $ne: 'lead' } },
+          { title: { $not: /lead/i } }
+        ],
+        read: false
+      };
+    } else {
+      const conditions = [
+        { recipient: userId },
+        ...(userObjId ? [{ recipient: userObjId }] : [])
+      ];
+      if (role) conditions.push({ recipientRole: role });
+      if (dbRole && dbRole !== role) conditions.push({ recipientRole: dbRole });
+      conditions.push({ recipientRole: 'all' });
+      query = {
+        $or: conditions,
+        read: false
+      };
     }
 
     await Notification.updateMany(
-      { $or: conditions, read: false },
+      query,
       { read: true, readAt: new Date() }
     );
 
@@ -143,17 +189,42 @@ export async function clearAllNotifications(req, res, next) {
   try {
     const userId = req.user.id;
     const role = req.user.role;
+    const dbRole = req.user.dbRole;
     const isRoot = role === 'root' || req.user.dbRole === 'root';
 
-    const conditions = [
-      { recipient: userId },
-      { recipientRole: role }
-    ];
+    let userObjId = null;
+    try {
+      userObjId = new mongoose.Types.ObjectId(userId);
+    } catch (e) {}
+
+    let query;
     if (isRoot) {
-      conditions.push({ recipientRole: 'root' }, { recipientRole: 'superadmin' });
+      query = {
+        $and: [
+          {
+            $or: [
+              { recipient: userId },
+              { recipientRole: 'root' },
+              { recipientRole: 'superadmin' },
+              { recipientRole: 'all' }
+            ]
+          },
+          { entityType: { $ne: 'lead' } },
+          { title: { $not: /lead/i } }
+        ]
+      };
+    } else {
+      const conditions = [
+        { recipient: userId },
+        ...(userObjId ? [{ recipient: userObjId }] : [])
+      ];
+      if (role) conditions.push({ recipientRole: role });
+      if (dbRole && dbRole !== role) conditions.push({ recipientRole: dbRole });
+      conditions.push({ recipientRole: 'all' });
+      query = { $or: conditions };
     }
 
-    await Notification.deleteMany({ $or: conditions });
+    await Notification.deleteMany(query);
     return res.json({ success: true, message: 'All notifications cleared' });
   } catch (err) {
     console.error('clearAllNotifications error:', err);

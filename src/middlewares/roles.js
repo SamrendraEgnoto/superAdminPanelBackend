@@ -8,11 +8,14 @@ export function allowRoles(roles = []) {
 
   return (req, res, next) => {
     const userRole = req.user?.role?.toLowerCase();
+    const userDbRole = req.user?.dbRole?.toLowerCase();
     const effectiveRoles = [...normalizedRoles];
-    if (effectiveRoles.includes('superadmin') && !effectiveRoles.includes('root')) {
-      effectiveRoles.push('root');
+    if (effectiveRoles.includes('superadmin')) {
+      if (!effectiveRoles.includes('root')) effectiveRoles.push('root');
+      if (!effectiveRoles.includes('delegated')) effectiveRoles.push('delegated');
     }
-    if (!req.user || !effectiveRoles.includes(userRole)) {
+    const hasRole = effectiveRoles.includes(userRole) || (userDbRole && effectiveRoles.includes(userDbRole));
+    if (!req.user || !hasRole) {
       return res.status(403).json({ message: 'Forbidden' });
     }
     next();

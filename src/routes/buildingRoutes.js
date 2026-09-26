@@ -28,6 +28,6 @@ router.delete("/:id/assign/:userId", authenticateJWT, allowRoles(["admin", "supe
 
 // Other lead actions
 router.post("/distribute", authenticateJWT, allowRoles(["admin", "superadmin"]), distributeLeads);
-router.patch("/:id/status", authenticateJWT, allowRoles(["admin", "superadmin"]), updateStatus);
+router.patch("/:id/status", authenticateJWT, allowRoles(["admin", "superadmin", "user"]), updateStatus);
 
 export default router;

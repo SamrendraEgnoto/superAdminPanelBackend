@@ -120,11 +120,15 @@ export async function createBuilding(req, res, next) {
 
     // Trigger in-app + email notification for the new lead
     const rawCustomerName = (`${userInfo.firstName || ''} ${userInfo.lastName || ''}`.trim() || userInfo.customerName || userInfo.email || '').trim();
-    notificationService.notifyLeadArrival(newLead, { 
-      admin: managedByAdmin, 
-      superAdmin: managedBySuperAdmin,
-      rawCustomerName
-    }).catch(err => console.error('Lead arrival notification error:', err));
+    try {
+      await notificationService.notifyLeadArrival(newLead, { 
+        admin: managedByAdmin, 
+        superAdmin: managedBySuperAdmin,
+        rawCustomerName
+      });
+    } catch (err) {
+      console.error('Lead arrival notification error:', err.message);
+    }
 
     // Attach the lead-scoped customer-rights token + link so the caller (or the
     // confirmation email builder) can give the customer access to their data.
@@ -285,16 +289,19 @@ export async function createPublicBuilding(req, res, next) {
 
     // =============== NOTIFICATIONS ===============
     const rawCustomerName = (fullName || `${firstName} ${lastName}`.trim() || userInfo.email || '').trim();
-    Promise.all([
-      managedByAdmin ? Admin.findById(managedByAdmin) : null,
-      managedBySuperAdmin ? SuperAdmin.findById(managedBySuperAdmin) : null
-    ]).then(([targetAdmin, targetSA]) => {
-      notificationService.notifyLeadArrival(newLead, { 
+    try {
+      const [targetAdmin, targetSA] = await Promise.all([
+        managedByAdmin ? Admin.findById(managedByAdmin) : null,
+        managedBySuperAdmin ? SuperAdmin.findById(managedBySuperAdmin) : null
+      ]);
+      await notificationService.notifyLeadArrival(newLead, { 
         admin: targetAdmin || managedByAdmin, 
         superAdmin: targetSA || managedBySuperAdmin,
         rawCustomerName
       });
-    }).catch(err => console.error('Public lead notification error:', err));
+    } catch (err) {
+      console.error('Public lead notification error:', err.message);
+    }
     // =============================================
 
     return res.status(201).json({
@@ -434,29 +441,70 @@ export async function getBuilding(req, res, next) {
   try {
     const lead = await BuildingInfo.findById(req.params.id)
       .populate('owner', 'firstName lastName')
-      .populate('assignedUsers.user', 'firstName lastName email');
+      .populate('assignedUsers.user', 'firstName lastName email phone adminId createdBy');
 
     if (!lead) {
       return res.status(404).json({ message: 'Lead not found' });
     }
 
-    const userId = req.user.id;
+    const userId = req.user.id ? req.user.id.toString() : '';
     const isSameUser = (a) =>
-      a?.user && a.user._id && a.user._id.toString() === userId;
+      a?.user && (a.user._id ? a.user._id.toString() : a.user.toString()) === userId;
 
     // ================= ACCESS CONTROL =================
     if (req.user.role === 'user') {
+      const userAdminId = (req.user.adminId || req.user.createdBy)?.toString();
       const isOwner = lead.owner?.toString() === userId;
       const assigned = lead.assignedUsers.find(isSameUser);
+      const isOrgLead = userAdminId && (
+        lead.managedByAdmin?.toString() === userAdminId ||
+        lead.managedBySuperAdmin?.toString() === userAdminId ||
+        (lead.sharedWith || []).some(s => (s.adminId?._id || s.adminId)?.toString() === userAdminId)
+      );
 
-      if (!isOwner && !assigned) {
+      if (!isOwner && !assigned && !isOrgLead) {
         return res.status(403).json({ message: 'No access to this lead' });
+      }
+    } else if (req.user.role === 'admin') {
+      const callerAdmin = await Admin.findById(userId).select('adminType createdById createdBy');
+      if (callerAdmin && callerAdmin.adminType === 'data-viewer') {
+        const isShared = (lead.sharedWith || []).some(
+          s => (s.adminId?._id || s.adminId)?.toString() === userId
+        );
+        const isAssigned = (lead.assignedUsers || []).some(isSameUser);
+        const isManaged = lead.managedByAdmin?.toString() === userId;
+        const isOwner = lead.owner?.toString() === userId;
+        const parentId = (callerAdmin.createdById || callerAdmin.createdBy)?.toString();
+        const isParentDsaLead = parentId && lead.managedBySuperAdmin &&
+          lead.managedBySuperAdmin.toString() === parentId;
+
+        if (!isShared && !isAssigned && !isManaged && !isOwner && !isParentDsaLead) {
+          return res.status(403).json({ message: 'No access to this lead' });
+        }
       }
     }
 
+    // Warm tenant DEKs for all possible stakeholders on this lead
+    const tenantIds = new Set();
+    if (lead.managedByAdmin) tenantIds.add(lead.managedByAdmin.toString());
+    if (lead.managedBySuperAdmin) tenantIds.add(lead.managedBySuperAdmin.toString());
+    if (lead.owner) tenantIds.add(lead.owner.toString());
+    if (req.user?.id) tenantIds.add(req.user.id.toString());
+    if (req.user?.adminId) tenantIds.add(req.user.adminId.toString());
+    if (req.user?.createdBy) tenantIds.add(req.user.createdBy.toString());
+    (lead.assignedUsers || []).forEach(au => {
+      const u = au.user;
+      if (u && typeof u === 'object') {
+        if (u.adminId) tenantIds.add((u.adminId._id || u.adminId).toString());
+        if (u.createdBy) tenantIds.add((u.createdBy._id || u.createdBy).toString());
+        if (u._id) tenantIds.add(u._id.toString());
+      }
+    });
+    await Promise.all(Array.from(tenantIds).map(tid => ensureTenantDEK(tid).catch(() => null)));
+
     // ================= PERMISSIONS =================
     let currentUserPermissions = [];
-    if (req.user.role === 'admin' || req.user.role === 'superadmin') {
+    if (req.user.role === 'admin' || req.user.role === 'superadmin' || req.user.role === 'delegated') {
       currentUserPermissions = ['read', 'edit', 'delete'];
     } else {
       const isOwner = lead.owner?.toString() === userId;
@@ -479,24 +527,51 @@ export async function getBuilding(req, res, next) {
     next(err);
   }
 }
+
 // ############################ UPDATE LEAD ############################
 export async function updateBuilding(req, res, next) {
   try {
     const building = await BuildingInfo.findById(req.params.id);
     if (!building) return res.status(404).json({ message: 'Building not found' });
 
+    const userId = req.user.id ? req.user.id.toString() : '';
+
     if (req.user.role === 'admin') {
-      // Admin - handled by allowRoles at route level
-    } else if (req.user.role !== 'superadmin') {
-      // Non-admin users: check edit permission via permissions object
-      const assigned = building.assignedUsers.find(
-        (a) => a.user.toString() === req.user.id
+      const callerAdmin = await Admin.findById(userId).select('adminType createdById createdBy');
+      if (callerAdmin && callerAdmin.adminType === 'data-viewer') {
+        const isShared = (building.sharedWith || []).some(
+          s => (s.adminId?._id || s.adminId)?.toString() === userId
+        );
+        const isAssigned = (building.assignedUsers || []).some(
+          a => (a.user?._id || a.user)?.toString() === userId
+        );
+        const isManaged = building.managedByAdmin?.toString() === userId;
+        const isOwner = building.owner?.toString() === userId;
+        const parentId = (callerAdmin.createdById || callerAdmin.createdBy)?.toString();
+        const isParentDsaLead = parentId && building.managedBySuperAdmin &&
+          building.managedBySuperAdmin.toString() === parentId;
+
+        if (!isShared && !isAssigned && !isManaged && !isOwner && !isParentDsaLead) {
+          return res.status(403).json({ message: 'You do not have edit permission for this lead' });
+        }
+      }
+    } else if (req.user.role !== 'superadmin' && req.user.role !== 'delegated') {
+      const userAdminId = (req.user.adminId || req.user.createdBy)?.toString();
+      const isOwner = building.owner?.toString() === userId;
+      const assigned = (building.assignedUsers || []).find(
+        (a) => (a.user?._id || a.user)?.toString() === userId
+      );
+      const isOrgLead = userAdminId && (
+        building.managedByAdmin?.toString() === userAdminId ||
+        building.managedBySuperAdmin?.toString() === userAdminId ||
+        (building.sharedWith || []).some(s => (s.adminId?._id || s.adminId)?.toString() === userAdminId)
       );
 
-      if (!assigned || !assigned.permissions.includes('edit')) {
+      if (!isOwner && !isOrgLead && (!assigned || !assigned.permissions.includes('edit'))) {
         return res.status(403).json({ message: 'You do not have edit permission' });
       }
     }
+
     Object.assign(building, req.body);
     // Mixed fields need explicit markModified for nested changes
     if (req.body.attributes) building.markModified('attributes');
@@ -524,15 +599,41 @@ export async function deleteBuilding(req, res, next) {
     if (!building) {
       return res.status(404).json({ message: 'Building not found' });
     }
+
+    const userId = req.user.id ? req.user.id.toString() : '';
+
     if (req.user.role === 'admin') {
-      // Admin delete handled by allowRoles at route level (only admins/superadmins reach here)
-    } else if (req.user.role !== 'superadmin') {
-      // Non-admin users: check delete permission via permissions object
-      const assigned = building.assignedUsers.find(
-        (a) => a.user.toString() === req.user.id
+      const callerAdmin = await Admin.findById(userId).select('adminType createdById createdBy');
+      if (callerAdmin && callerAdmin.adminType === 'data-viewer') {
+        const isShared = (building.sharedWith || []).some(
+          s => (s.adminId?._id || s.adminId)?.toString() === userId
+        );
+        const isAssigned = (building.assignedUsers || []).some(
+          a => (a.user?._id || a.user)?.toString() === userId
+        );
+        const isManaged = building.managedByAdmin?.toString() === userId;
+        const isOwner = building.owner?.toString() === userId;
+        const parentId = (callerAdmin.createdById || callerAdmin.createdBy)?.toString();
+        const isParentDsaLead = parentId && building.managedBySuperAdmin &&
+          building.managedBySuperAdmin.toString() === parentId;
+
+        if (!isShared && !isAssigned && !isManaged && !isOwner && !isParentDsaLead) {
+          return res.status(403).json({ message: 'You do not have delete permission for this lead' });
+        }
+      }
+    } else if (req.user.role !== 'superadmin' && req.user.role !== 'delegated') {
+      const userAdminId = (req.user.adminId || req.user.createdBy)?.toString();
+      const isOwner = building.owner?.toString() === userId;
+      const assigned = (building.assignedUsers || []).find(
+        (a) => (a.user?._id || a.user)?.toString() === userId
+      );
+      const isOrgLead = userAdminId && (
+        building.managedByAdmin?.toString() === userAdminId ||
+        building.managedBySuperAdmin?.toString() === userAdminId ||
+        (building.sharedWith || []).some(s => (s.adminId?._id || s.adminId)?.toString() === userAdminId)
       );
 
-      if (!assigned || !assigned.permissions.includes('delete')) {
+      if (!isOwner && !isOrgLead && (!assigned || !assigned.permissions.includes('delete'))) {
         return res.status(403).json({
           message: 'You do not have delete permission'
         });
@@ -706,6 +807,43 @@ export const updateStatus = async (req, res, next) => {
 
     const building = await BuildingInfo.findById(id);
     if (!building) return res.status(404).json({ message: 'Building not found' });
+
+    const userId = req.user?.id ? req.user.id.toString() : '';
+
+    if (req.user?.role === 'user') {
+      const userAdminId = (req.user.adminId || req.user.createdBy)?.toString();
+      const isOwner = building.owner?.toString() === userId;
+      const isAssigned = (building.assignedUsers || []).some(
+        a => (a.user?._id || a.user)?.toString() === userId
+      );
+      const isOrgLead = userAdminId && (
+        building.managedByAdmin?.toString() === userAdminId ||
+        building.managedBySuperAdmin?.toString() === userAdminId ||
+        (building.sharedWith || []).some(s => (s.adminId?._id || s.adminId)?.toString() === userAdminId)
+      );
+
+      if (!isOwner && !isAssigned && !isOrgLead) {
+        return res.status(403).json({ message: 'You do not have permission to update this lead status' });
+      }
+    } else if (req.user?.role === 'admin') {
+      const callerAdmin = await Admin.findById(userId).select('adminType createdById createdBy');
+      if (callerAdmin && callerAdmin.adminType === 'data-viewer') {
+        const isShared = (building.sharedWith || []).some(
+          s => (s.adminId?._id || s.adminId)?.toString() === userId
+        );
+        const isAssigned = (building.assignedUsers || []).some(
+          a => (a.user?._id || a.user)?.toString() === userId
+        );
+        const isManaged = building.managedByAdmin?.toString() === userId;
+        const parentId = (callerAdmin.createdById || callerAdmin.createdBy)?.toString();
+        const isParentDsaLead = parentId && building.managedBySuperAdmin &&
+          building.managedBySuperAdmin.toString() === parentId;
+
+        if (!isShared && !isAssigned && !isManaged && !isParentDsaLead) {
+          return res.status(403).json({ message: 'You do not have permission to update this lead status' });
+        }
+      }
+    }
 
     building.status = status;
     await building.save();

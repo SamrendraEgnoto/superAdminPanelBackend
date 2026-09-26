@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import BuildingInfo from '../models/BuildingInfo.js';
 import Admin from '../models/Admin.js';
 import SuperAdmin from '../models/SuperAdmin.js';
@@ -6,6 +7,7 @@ import AuditLog from '../models/AuditLog.js';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
 import { buildCustomerRightsLink } from '../utils/customerToken.js';
+import { resolveEmbedKey } from '../middlewares/embedKeyAuth.js';
 
 // Shared service credential for bridge authentication
 // Both Super Admin Panel and Estimator_Node must configure the same value
@@ -114,11 +116,23 @@ export async function submitLeadFromEstimator(req, res, next) {
       });
     }
 
-    // 2. Look up the Admin or SuperAdmin directly by tenantId
-    let admin = await Admin.findById(tenantId);
+    // 2. Look up the Admin or SuperAdmin directly by tenantId (ObjectId or Embed Key)
+    let admin = null;
     let superAdmin = null;
-    if (!admin) {
-      superAdmin = await SuperAdmin.findById(tenantId);
+    if (tenantId && mongoose.Types.ObjectId.isValid(tenantId)) {
+      admin = await Admin.findById(tenantId);
+      if (!admin) {
+        superAdmin = await SuperAdmin.findById(tenantId);
+      }
+    }
+    if (!admin && !superAdmin && tenantId) {
+      const resolved = await resolveEmbedKey(tenantId);
+      if (resolved && resolved.valid) {
+        if (resolved.adminId) admin = await Admin.findById(resolved.adminId);
+        if (resolved.superAdminId && (!admin || resolved.isSuperAdmin)) {
+          superAdmin = await SuperAdmin.findById(resolved.superAdminId);
+        }
+      }
     }
     if (!admin && !superAdmin) {
       // Log failed lookup
@@ -266,6 +280,18 @@ export async function submitLeadFromEmbed(req, res, next) {
 
     if (req.adminId) {
       await Admin.incrementTotalLeads(req.adminId);
+    }
+
+    // Trigger in-app + email notification for the tenant (RCA or DSA)
+    try {
+      const rawCustomerName = (`${userInfo.firstName || ''} ${userInfo.lastName || ''}`.trim() || userInfo.email || '').trim();
+      await notificationService.notifyLeadArrival(lead, {
+        admin: req.adminId || undefined,
+        superAdmin: managedBySuperAdmin,
+        rawCustomerName
+      });
+    } catch (notifyErr) {
+      console.error('[Embed] Lead arrival notification error:', notifyErr.message);
     }
 
     res.status(201).json({
